@@ -28,6 +28,8 @@ from .base import (
 
 from .kpi import kpi_report
 from .model import ClanBattle, ClanbattleItem, ClanBattlePool, PrioritizedQueryItem
+from ..login import run_group
+from ..util.tools import anywhere_send
 
 help_text = """
 * “+” 表示空格
@@ -156,15 +158,23 @@ async def daostate(bot: HoshinoBot, ev: CQEvent):
 
     msg = ""
     for i in range(1, 5 + 1):
-        if apply_info := await pcr_sqla.get_notice(NoticeType.apply.value, group_id, i):
+        apply_info = await pcr_sqla.get_notice(NoticeType.apply.value, group_id, i)
+        tree_info = await pcr_sqla.get_notice(NoticeType.tree.value, group_id, i)
+        if apply_info or tree_info:
             msg += f"========={i}王=========\n"
-            msg += f"当前有{len(apply_info)}人申请挑战boss\n"
-            for i, info in enumerate(apply_info):
-                member_info = await bot.get_group_member_info(
-                    group_id=group_id, user_id=info.user_id
-                )
-                name = member_info["card"] or member_info["nickname"]
-                msg += f"->{i+1}：{name} {info.text} 已过去{format_time(now - info.time)}\n"
+            if apply_info:
+                msg += f"当前有{len(apply_info)}人申请挑战boss\n"
+                for idx, info in enumerate(apply_info):
+                    member_info = await bot.get_group_member_info(group_id=group_id, user_id=info.user_id)
+                    name = member_info["card"] or member_info["nickname"]
+                    msg += f"->{idx+1}：{name} {info.text} 已过去{format_time(now - info.time)}\n"
+            if tree_info:
+                msg += f"当前有{len(tree_info)}人在树上\n"
+                for jdx, player in enumerate(tree_info):
+                    member_info= await bot.get_group_member_info(group_id=ev.group_id, user_id=player.user_id)
+                    name = member_info["card"] or member_info["nickname"]
+                    msg += f"->{jdx+1}：{name} {player.text} 已过去{format_time(now - player.time)}\n"
+                    
     if msg:
         await bot.send(ev, msg.strip())
 
@@ -251,10 +261,11 @@ async def cleansubscirbe(bot: HoshinoBot, ev: CQEvent, qq_id: int):
 
 
 @sv.on_fullmatch(("sl", "SL", "Sl"))
-async def addsl(bot: HoshinoBot, ev: CQEvent):
+@check_priv_adimin()
+async def addsl(bot: HoshinoBot, ev: CQEvent, qq_id: int):
 
     if await pcr_sqla.add_sl(
-        SLDao(group_id=ev.group_id, user_id=ev.user_id, time=int(time.time()))
+        SLDao(group_id=ev.group_id, user_id=qq_id, time=int(time.time()))
     ):
         notice_update_time[ev.group_id] = int(time.time())
         await bot.send(ev, "SL已记录", at_sender=True)
@@ -263,15 +274,17 @@ async def addsl(bot: HoshinoBot, ev: CQEvent):
 
 
 @sv.on_fullmatch(("sl?", "SL?", "sl？", "SL？"))
-async def issl(bot: HoshinoBot, ev: CQEvent):
-    if await pcr_sqla.check_sl(ev.user_id, ev.group_id):
+@check_priv_adimin()
+async def issl(bot: HoshinoBot, ev: CQEvent, qq_id: int):
+    if await pcr_sqla.check_sl(qq_id, ev.group_id):
         await bot.send(ev, "今天已经SL过了", at_sender=True)
     else:
         await bot.send(ev, "今天还没有使用过SL", at_sender=True)
 
 
 @sv.on_rex(r"^(上|挂)树\s?(\d)\s?(.+)?$")
-async def climbtree(bot: HoshinoBot, ev: CQEvent):
+@check_priv_adimin()
+async def climbtree(bot: HoshinoBot, ev: CQEvent, qq_id: int):
     match: re.Match = ev["match"]
     boss = match[2]
     text = match[3] or " "
@@ -279,7 +292,7 @@ async def climbtree(bot: HoshinoBot, ev: CQEvent):
         NoticeCache(
             group_id=ev.group_id,
             notice_type=NoticeType.tree.value,
-            user_id=ev.user_id,
+            user_id=qq_id,
             boss=boss,
             text=text,
         )
@@ -289,8 +302,9 @@ async def climbtree(bot: HoshinoBot, ev: CQEvent):
 
 
 @sv.on_fullmatch("下树")
-async def offtree(bot: HoshinoBot, ev: CQEvent):
-    await pcr_sqla.delete_notice(NoticeType.tree.value, ev.group_id, user_id=ev.user_id)
+@check_priv_adimin()
+async def offtree(bot: HoshinoBot, ev: CQEvent, qq_id: int):
+    await pcr_sqla.delete_notice(NoticeType.tree.value, ev.group_id, user_id=qq_id)
     notice_update_time[ev.group_id] = int(time.time())
     await bot.send(ev, "下树成功", at_sender=True)
 
@@ -310,7 +324,8 @@ async def checktree(bot: HoshinoBot, ev: CQEvent):
 
 
 @sv.on_rex(r"^申请出刀\s?(\d)\s?(\S+)?$")
-async def apply(bot: HoshinoBot, ev: CQEvent):
+@check_priv_adimin()
+async def apply(bot: HoshinoBot, ev: CQEvent, qq_id: int):
 
     match: re.Match = ev["match"]
     boss = match[1]
@@ -320,7 +335,7 @@ async def apply(bot: HoshinoBot, ev: CQEvent):
         NoticeCache(
             group_id=ev.group_id,
             notice_type=NoticeType.apply.value,
-            user_id=ev.user_id,
+            user_id=qq_id,
             boss=boss,
             text=text,
         )
@@ -516,3 +531,12 @@ async def refresh_boss_info():
 @sv.scheduled_job("cron", hour="8")
 async def refresh_record():
     await pcr_sqla.refresh(RecordDao, 30)
+
+@sv.scheduled_job('cron', hour='5', minute='5') #推送5点时的名次
+async def rank_and_status():
+    for group_id in run_group:
+        clan_info: ClanBattle = clanbattle_info[group_id]
+        msg = f'凌晨5点时的排名为：{clan_info.rank}'
+        if not clan_info.loop_check:
+            continue
+        await anywhere_send(self_id = clan_info.bot_id, group_id = group_id, message = msg)

@@ -233,8 +233,7 @@ class ClanBattle:
             if history.create_time <= self.latest_time:
                 break
             self.notice_dao.append(
-                f"{history.name}对{history.lap_num}周目{history.order_num}王造成了{history.damage}点伤害。"
-            )
+                f'{history.name}对{history.lap_num}周目{history.order_num}王造成了{history.damage:,}点伤害。{"并击破" if history.kill else ""}')
             # 通知挂树，清空申请出刀
             if history.kill:
                 if offtree_text := await self.notice_text(
