@@ -20,6 +20,7 @@ from ..login import check_client, run_group
 from ..util.task_pool import PoolBase, PrioritizedQueryItemBase
 from ..util.tools import anywhere_send
 from .get_img import render_atk_def_teams, generate_player_rank
+from .query_jjc import do_query
 
 from .base import id_str2list
 
