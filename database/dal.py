@@ -91,6 +91,13 @@ class SQALA:
                     .values(allow_others=level)
                 )
 
+    async def delete_account(self, user_id: int):
+        async with self.async_session() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(Account).where(Account.user_id == user_id)
+                )
+
     async def query_refresh(self, account: str) -> RefreshAccount:
         async with self.async_session() as session:
             async with session.begin():

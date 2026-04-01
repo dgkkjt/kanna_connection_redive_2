@@ -28,6 +28,7 @@ sv_help = """
 【台绑定账号+short_udid+udid_viewer_id】加号为空格
 login_id和token群里有提取器
 short_udid、udid和viewer_id也有提取器
+【删除账号绑定】删除你的账号绑定
 """
 
 sv = Service("你只需要好好出刀", help_=sv_help, visible=True)
@@ -236,3 +237,13 @@ async def qu_bind(session: NoticeSession):
         if load_index := await check_client(client):
             await pcr_sqla.add_account(qq_id, {"name": load_index.user_info.user_name})
             await session.send("绑定成功")
+
+
+@on_command("删除绑定")
+async def delete_bind(session: NoticeSession):
+    qq_id = session.ctx.user_id
+    if await pcr_sqla.query_account(qq_id):
+        await pcr_sqla.delete_account(qq_id)
+        await session.send("账号绑定已删除")
+    else:
+        await session.send("你没有绑定账号")
