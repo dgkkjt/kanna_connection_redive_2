@@ -539,4 +539,4 @@ async def rank_and_status():
         msg = f'凌晨5点时的排名为：{clan_info.rank}'
         if not clan_info.loop_check:
             continue
-        await anywhere_send(self_id = clan_info.bot_id, group_id = group_id, message = msg)
+        await anywhere_send(self_id = clan_info.bot_id, group_id = group_id, msg = msg)
