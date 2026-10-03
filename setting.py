@@ -46,7 +46,7 @@ class WebSetting(Enum):
     """
 
     api_host = "127.0.0.1"
-    api_port = "12139"
+    api_port = "49173"
     cookie_secure = False
     web_public_url = "http://xxxx:12138/kanna_connection"
 
