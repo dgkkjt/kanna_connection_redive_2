@@ -10,6 +10,7 @@ from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, func
 
 from ..basedata import FilePath, NoticeType
+from .reconciliation import migrate as migrate_damage_reconciliation, encode
 from .models import (
     Account,
     ArenaSetting,
@@ -63,6 +64,7 @@ class SQALA:
     async def create_all(self):
         async with self.engine.begin() as conn:
             await conn.run_sync(DataBase.metadata.create_all)
+            await migrate_damage_reconciliation(conn)
             columns = {
                 row[1]
                 for row in (
@@ -208,7 +210,7 @@ class SQALA:
             async with session.begin():
                 session.add_all(dao_list)
 
-    async def correct_kill_damage(self, group_id: int, caps: dict):
+    async def correct_kill_damage(self, group_id: int, caps: dict, evidence=None, battle_id=None):
         async with self.async_session() as session:
             async with session.begin():
                 for (pcrid, lap, boss, timestamp), cap in caps.items():
@@ -219,11 +221,16 @@ class SQALA:
                             RecordDao.lap == lap,
                             RecordDao.boss == boss,
                             RecordDao.time == timestamp,
+                            RecordDao.clan_battle_id == battle_id,
                         )
                     )
                     records = result.scalars().all()
-                    if len(records) == 1 and records[0].damage > cap:
+                    if (len(records) == 1 and records[0].damage > cap
+                            and not records[0].correction_method):
                         records[0].damage = cap
+                        records[0].correction_method = "snapshot"
+                        records[0].correction_evidence = encode((evidence or {}).get((pcrid, lap, boss, timestamp), {}))
+                        records[0].corrected_at = int(time.time())
 
     async def get_record_keys_at(self, group_id: int, timestamp: int) -> set:
         async with self.async_session() as session:

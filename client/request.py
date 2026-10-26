@@ -109,6 +109,28 @@ class ClanBattleReloadDetailInfoRequest(RequestBase):
         return "clan_battle/reload_detail_info"
 
 
+class ClanBattleBossInfoRequest(RequestBase):
+    clan_id: int = None
+    clan_battle_id: int = None
+    lap_num: int = None
+    order_num: int = None
+
+    @property
+    def url(self) -> str:
+        return "clan_battle/boss_info"
+
+
+class ClanBattleBossHistoryRequest(RequestBase):
+    clan_id: int = None
+    clan_battle_id: int = None
+    period: int = None
+    page: int = None
+
+    @property
+    def url(self) -> str:
+        return "clan_battle/boss_history"
+
+
 class ClanBattleLogListRequest(RequestBase):
     clan_battle_id: int = None
     order_num: int = 0

@@ -218,6 +218,17 @@ class ClanBattleReloadDetailInfoResponse(BaseModel):
     current_hp: int = None
 
 
+class ClanBattleBossInfoResponse(BaseModel):
+    damage_history: List[DamageHistory] = None
+    current_hp: int = None
+    attack_count: int = None
+    fighter_num: int = None
+
+
+class ClanBattleBossHistoryResponse(BaseModel):
+    boss_history: List[BossHistory] = None
+
+
 class ClanBattleLogListResponse(BaseModel):
     clan_battle_mode: int = None
     battle_list: List[BattleInfo] = None

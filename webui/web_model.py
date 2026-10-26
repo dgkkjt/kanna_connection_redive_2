@@ -384,6 +384,10 @@ class NoticeResponse(BaseModel):
 class DaoInfo(BaseModel):
     name: str = ""
     damage: int = 0
+    raw_damage: Optional[int] = None
+    correction_method: str = ""
+    correction_evidence: str = "{}"
+    corrected_at: int = 0
     score: int = 0
     type: str = ""
     date: int = 0

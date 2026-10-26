@@ -28,6 +28,7 @@ from .base import (
 
 from .kpi import kpi_report
 from .model import ClanBattle, ClanbattleItem, ClanBattlePool, PrioritizedQueryItem
+from .reconciliation import damage_reconciler
 from ..login import run_group
 from ..util.tools import anywhere_send
 
@@ -66,6 +67,11 @@ help_text = """
 clanbattle_info: Dict[int, ClanBattle] = {}
 notice_update_time: Dict[int, int] = {}
 clanbattle_pool = ClanBattlePool(ClientSetting.clanbattle_max.value)
+
+
+@nonebot.on_startup
+async def start_damage_reconciliation():
+    damage_reconciler.start()
 
 sv = Service(
     name="自动报刀2",  # 功能名

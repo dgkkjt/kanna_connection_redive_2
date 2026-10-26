@@ -7,6 +7,7 @@ from Crypto.Util.Padding import pad, unpad
 import httpx
 import asyncio
 import threading
+import contextvars
 from msgpack import unpackb
 from .request import (
     RequestBase,
@@ -49,6 +50,13 @@ from .response import (
 )
 
 
+background_request = contextvars.ContextVar("damage_reconciliation_request", default=False)
+
+
+class BackgroundBusy(Exception):
+    """Foreground traffic owns or is waiting for this account."""
+
+
 class CrossLoopLock:
     """可跨事件循环使用的异步互斥锁。
 
@@ -61,10 +69,23 @@ class CrossLoopLock:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._waiters = 0
+        self._guard = threading.Lock()
 
     async def __aenter__(self):
-        while not self._lock.acquire(blocking=False):
-            await asyncio.sleep(0.05)
+        if background_request.get():
+            with self._guard:
+                if self._waiters or not self._lock.acquire(blocking=False):
+                    raise BackgroundBusy()
+            return self
+        with self._guard:
+            self._waiters += 1
+        try:
+            while not self._lock.acquire(blocking=False):
+                await asyncio.sleep(0.05)
+        finally:
+            with self._guard:
+                self._waiters -= 1
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -136,6 +157,13 @@ class BaseClient:
 
     async def callapi(self, request: RequestBase) -> Union[dict, Tuple[dict, dict]]:
         raise NotImplementedError
+
+    async def reconciliation_call(self, request):
+        token = background_request.set(True)
+        try:
+            return await asyncio.wait_for(self.callapi(request), timeout=5)
+        finally:
+            background_request.reset(token)
 
     async def login(self):
         raise NotImplementedError

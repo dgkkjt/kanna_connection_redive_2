@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import time
+from time import time as unix_time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List
@@ -27,6 +28,8 @@ from ..util.tools import anywhere_send
 from ..util.auto_boss import clan_boss_info
 from .base import find_item, format_bignum, format_precent
 from .damage_correction import DamageCorrectionTracker
+from .reconciliation import damage_reconciler
+from ..database.reconciliation import encode
 
 from traceback import format_exc
 
@@ -68,11 +71,13 @@ class ClanBattle:
             clan_battle_top = await self.get_clanbattle_top()
 
         self.clan_battle_id = clan_battle_top.clan_battle_id
+        self.battle_period = clan_battle_top.period
         self.clan_name = clan_battle_top.user_clan.clan_name
         self.lap_num = clan_battle_top.lap_num
         self.period = clan_boss_info.lap2stage(self.lap_num)
         self.refresh_latest_time(clan_battle_top)
         self.damage_correction.reset(clan_battle_top)
+        await damage_reconciler.register(self, clan_battle_top)
         self.members: Dict[int, str] = await self.all_member()
         self.dao_update_time = int(time.time())
 
@@ -102,7 +107,9 @@ class ClanBattle:
         return 0  # 0不播报，没改变不报，改变了是0也不报
 
     async def get_battle_log(self, page: int) -> ClanBattleLogListResponse:
-        return await self.client.clan_battle_log(page, self.clan_battle_id)
+        response = await self.client.clan_battle_log(page, self.clan_battle_id)
+        damage_reconciler.offer_page(self, response)
+        return response
 
     async def add_record(self, loop_num: int):
         log_list: List[BattleInfo] = []
@@ -161,6 +168,9 @@ class ClanBattle:
             ),
             "time": time,
             "pcrid": pcrid,
+            "raw_damage": record.total_damage,
+            "clan_battle_id": self.clan_battle_id,
+            "server_battle_log_id": record.battle_log_id,
             "remain_time": time_line.start_remain_time,
             "battle_time": time_line.battle_time,
             "flag": (
@@ -169,6 +179,14 @@ class ClanBattle:
                 else (0.5 if time_line.start_remain_time < 90 else 0)
             ),
         }
+        key = (pcrid, record.lap_num, record.order_num, time)
+        evidence = (
+            self.damage_correction.evidence.get(key)
+            if allow_damage_correction and self.damage_correction.cap_for(key) is not None else None
+        )
+        if evidence:
+            temp_dict.update(correction_method="snapshot", correction_evidence=encode(evidence),
+                             corrected_at=int(unix_time()))
         for i, unit in enumerate(record.units):
             temp_dict[f"unit{i+1}"] = unit.unit_id
             temp_dict[f"unit{i+1}_level"] = unit.unit_level
@@ -252,7 +270,9 @@ class ClanBattle:
         return change
 
     async def record_change(self, clan_battle_top: ClanBattleTopResponse):
-        for history in self.damage_correction.update(clan_battle_top):
+        histories = self.damage_correction.update(clan_battle_top)
+        await damage_reconciler.observe(self, clan_battle_top, histories)
+        for history in histories:
             damage = self.damage_correction.history_damage(history)
             correction = (
                 f"（原始伤害{history.damage:,}，已扣除超量伤害）"
@@ -276,7 +296,9 @@ class ClanBattle:
         # previous iteration. Fix that already-saved row as well as new inserts.
         pending = dict(self.damage_correction.pending_caps)
         if pending:
-            await pcr_sqla.correct_kill_damage(self.group_id, pending)
+            await pcr_sqla.correct_kill_damage(
+                self.group_id, pending, self.damage_correction.evidence, self.clan_battle_id
+            )
             for key, cap in pending.items():
                 if self.damage_correction.pending_caps.get(key) == cap:
                     del self.damage_correction.pending_caps[key]

@@ -22,10 +22,12 @@ class DamageCorrectionTracker:
         self.previous_valid = False
         self.events = OrderedDict()
         self.pending_caps = {}
+        self.evidence = {}
 
     def reset(self, top):
         self.events.clear()
         self.pending_caps.clear()
+        self.evidence.clear()
         for history in top.damage_history or []:
             self.events[history_identity(history)] = (history_key(history), None)
         self._snapshot(top)
@@ -113,19 +115,33 @@ class DamageCorrectionTracker:
         counts = {}
         for key, cap in self.events.values():
             counts[key] = counts.get(key, 0) + 1
+        for key, count in counts.items():
+            if count != 1:
+                self.evidence.pop(key, None)
         for history in new:
             key, cap = self.events[history_identity(history)]
             if cap is not None and counts[key] == 1:
                 self.pending_caps[key] = cap
+                self.evidence[key] = {
+                    "method": "snapshot", "previous_head": self.previous_head,
+                    "previous_hp": self.previous_bosses.get((history.lap_num, history.order_num)),
+                    "remaining_hp": cap,
+                    "histories": [dict(viewer_id=h.viewer_id, time=h.create_time,
+                                       damage=h.damage, kill=h.kill, history_id=h.history_id)
+                                  for h in reversed(new)
+                                  if h.lap_num == history.lap_num and h.order_num == history.order_num],
+                }
         for key in list(self.pending_caps):
             if counts.get(key) != 1:
                 del self.pending_caps[key]
+                self.evidence.pop(key, None)
 
         self._snapshot(top)
         # Keep at most a day's history; leave room for delayed detailed reports.
         newest = max((h.create_time for h in histories), default=0)
         for identity in list(self.events):
             if identity[1][3] < newest - 86400:
+                self.evidence.pop(identity[1], None)
                 del self.events[identity]
         return new
 
@@ -139,6 +155,7 @@ class DamageCorrectionTracker:
                 self.events[identity] = (key, None)
         for key in keys:
             self.pending_caps.pop(key, None)
+            self.evidence.pop(key, None)
 
     def history_damage(self, history):
         cap = self.cap_for(history_key(history))

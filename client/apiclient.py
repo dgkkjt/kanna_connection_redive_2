@@ -29,7 +29,7 @@ from ..errorclass import (
     TutorialError,
 )
 from ..util.tools import load_config
-from .base import BaseClient
+from .base import BaseClient, BackgroundBusy, background_request
 from .request import (
     CheckAgreementRequest,
     CheckGameStartRequest,
@@ -269,9 +269,11 @@ class BCRClient(BaseClient):
                     )
 
                 return (data, data_headers) if request.header else data
-        except ApiException:
+        except (ApiException, BackgroundBusy):
             raise
         except binascii.Error:
+            if background_request.get():
+                raise
             await asyncio.sleep(1)
             return await self.callapi(request)
         except (NoneResponseError, httpx.HTTPStatusError, httpx.HTTPError) as e:
@@ -456,9 +458,11 @@ class TWClient(BaseClient):
                     )
 
                 return data
-        except ApiException:
+        except (ApiException, BackgroundBusy):
             raise
         except binascii.Error:
+            if background_request.get():
+                raise
             await asyncio.sleep(1)
             return await self.callapi(request)
         except (NoneResponseError, httpx.HTTPStatusError, httpx.HTTPError) as e:

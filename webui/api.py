@@ -2176,6 +2176,10 @@ async def clan_report(
             DaoInfo(
                 name=player.name,
                 damage=player.damage,
+                raw_damage=player.raw_damage,
+                correction_method=player.correction_method,
+                correction_evidence=player.correction_evidence,
+                corrected_at=player.corrected_at,
                 score=int(
                     clan_boss_info.get_boss_rate(player.lap, player.boss)
                     * player.damage
@@ -2199,6 +2203,10 @@ async def clan_report(
                     DaoInfo(
                         dao=knife,
                         damage=dao.damage,
+                        raw_damage=dao.raw_damage,
+                        correction_method=dao.correction_method,
+                        correction_evidence=dao.correction_evidence,
+                        corrected_at=dao.corrected_at,
                         score=int(
                             clan_boss_info.get_boss_rate(dao.lap, dao.boss) * dao.damage
                         ),
