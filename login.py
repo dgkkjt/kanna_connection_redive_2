@@ -1,4 +1,5 @@
 import contextlib
+import threading
 from re import finditer
 from typing import Dict, Tuple
 import httpx
@@ -12,6 +13,7 @@ from .client import (
     pcrclient,
     tw_pcrclient,
     BaseClient,
+    CrossLoopLock,
     get_access_key,
 )
 from .database.models import Account, RefreshAccount
@@ -35,40 +37,54 @@ sv = Service("你只需要好好出刀", help_=sv_help, visible=True)
 
 run_group: Dict[int, int] = {}
 client_cache: Dict[Tuple[int, int], BaseClient] = {}
+client_login_locks: Dict[Tuple[int, int], CrossLoopLock] = {}
+client_login_locks_lock = threading.Lock()
+
+
+def get_client_login_lock(player: Tuple[int, int]) -> CrossLoopLock:
+    with client_login_locks_lock:
+        lock = client_login_locks.get(player)
+        if lock is None:
+            lock = CrossLoopLock()
+            client_login_locks[player] = lock
+        return lock
 
 
 async def query(account: Account, is_force=False):
     player = (account.viewer_id, account.platform)
-    if player in client_cache and not is_force:
-        client = client_cache[player]
-        if await check_client(client):
-            return client
-    if account.platform != Platform.tw_id.value:
-        client = pcrclient(account.account, account.password, account.platform)
-    else:
-        client = tw_pcrclient(
-            account.account,
-            account.password,
-            account.viewer_id,
-        )
-    try:
-        await client.login()
-    except NeedRefreshError:
-        logger.warning(f"{account.viewer_id}的access_key过期，重新获取")
-        bili_account = await pcr_sqla.query_refresh(account.refresh)
-        if bili_account:
-            uid, access_key = await get_access_key(
-                bili_account.account, bili_account.password, account.user_id
-            )
-            account.account = str(uid)
-            account.password = access_key
-            await pcr_sqla.add_account(account.user_id, account.dict(exclude_none=True))
+    async with get_client_login_lock(player):
+        if player in client_cache and not is_force:
+            client = client_cache[player]
+            if await check_client(client):
+                return client
+        if account.platform != Platform.tw_id.value:
             client = pcrclient(account.account, account.password, account.platform)
+        else:
+            client = tw_pcrclient(
+                account.account,
+                account.password,
+                account.viewer_id,
+            )
+        try:
             await client.login()
-    if await check_client(client):
-        client_cache[player] = client
-        return client
-    raise UnknowError("登录失败，请重试，很可能是网络问题")
+        except NeedRefreshError:
+            logger.warning(f"{account.viewer_id}的access_key过期，重新获取")
+            bili_account = await pcr_sqla.query_refresh(account.refresh)
+            if bili_account:
+                uid, access_key = await get_access_key(
+                    bili_account.account, bili_account.password, account.user_id
+                )
+                account.account = str(uid)
+                account.password = access_key
+                await pcr_sqla.add_account(
+                    account.user_id, account.dict(exclude_none=True)
+                )
+                client = pcrclient(account.account, account.password, account.platform)
+                await client.login()
+        if await check_client(client):
+            client_cache[player] = client
+            return client
+        raise UnknowError("登录失败，请重试，很可能是网络问题")
 
 
 @on_startup

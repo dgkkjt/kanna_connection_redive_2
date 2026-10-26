@@ -6,6 +6,7 @@ from sqlalchemy import asc, delete, desc, insert, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.future import select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, func
 
 from ..basedata import FilePath, NoticeType
@@ -41,8 +42,8 @@ class SQALA:
         self.url = f"sqlite+aiosqlite:///{url}"
         self.engine = create_async_engine(
             self.url,
-            pool_recycle=1500,  # 连接回收时间
-            pool_pre_ping=True,  # 使用前检查连接是否有效
+            # Bot 和 WebUI 使用不同事件循环，避免连接池跨 loop 复用连接。
+            poolclass=NullPool,
             echo=False,  # 关闭 SQL 日志减少内存
         )
         self.async_session = sessionmaker(
