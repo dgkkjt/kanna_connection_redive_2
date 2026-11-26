@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from loguru import logger
@@ -493,18 +494,68 @@ class MonitorIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return S(damage_history=hs, boss_info=[S(lap_num=27, order_num=5, current_hp=hp)])
         clan.damage_correction.reset(top([old], 521029119))
         clan.notice_text = AsyncMock(return_value="")
-        worker = S(observe=AsyncMock())
-        with patch.object(self.monitor_module, "damage_reconciler", worker):
-            await clan.record_change(top([b, a, old], 0))
-        self.assertIn("185,572,608", clan.notice_dao[0])
         record = S(**vars(INCIDENT[-1]), user_name="小心爱", units=[])
-        saved = await clan.general_single_record(record, record.battle_end_time)
+        page = S(max_page=1, battle_list=[record])
+        clan.get_battle_log = AsyncMock(return_value=page)
+        db = S(get_latest_time=AsyncMock(return_value=0), get_record_keys_at=AsyncMock(return_value=set()),
+               add_record=AsyncMock(), save_battle_entries=AsyncMock())
+        worker = S(observe=AsyncMock())
+        with patch.object(self.monitor_module, "damage_reconciler", worker), patch.object(self.monitor_module, "pcr_sqla", db):
+            self.assertTrue(await clan.record_change(top([b, a, old], 0)))
+        self.assertIn("185,572,608", clan.notice_dao[0])
+        self.assertIn("预计返秒61s", clan.notice_dao[0])
+        db.add_record.assert_awaited_once()
+        saved, = db.add_record.await_args.args[0]
         self.assertEqual(saved.damage, 185572608)
         self.assertEqual(saved.raw_damage, 334980665)
         self.assertEqual(saved.clan_battle_id, 99)
         self.assertEqual(saved.server_battle_log_id, record.battle_log_id)
         self.assertEqual(saved.correction_method, "snapshot")
         self.assertEqual(json.loads(saved.correction_evidence)["remaining_hp"], 185572608)
+
+    async def test_timer_save_retries_without_interrupting_reports(self):
+        clan = self.monitor_module.ClanBattle(1)
+        clan.entries.observe(1, 2, 1, 100)
+        clan.add_record = AsyncMock(return_value={})
+        top = S(damage_history=[], boss_info=[])
+        db = S(save_battle_entries=AsyncMock(side_effect=[OSError(), None]))
+        worker = S(observe=AsyncMock())
+        with patch.object(self.monitor_module, "pcr_sqla", db), patch.object(self.monitor_module, "damage_reconciler", worker):
+            for _ in range(3):
+                self.assertFalse(await clan.record_change(top))
+        self.assertEqual(db.save_battle_entries.await_count, 2)
+        self.assertEqual(worker.observe.await_count, 3)
+        clan.add_record.assert_not_awaited()
+        restored = self.monitor_module.EntryTracker("", clan.saved_entry_state)
+        self.assertEqual(restored.active_bosses(), [1])
+        restored.settle(S(history_id=1, viewer_id=1, order_num=1, lap_num=2, create_time=101, kill=1))
+        self.assertEqual(restored.active_bosses(), [])
+
+    async def test_poll_fetches_details_once_with_and_without_kills(self):
+        module = self.monitor_module
+        for has_kill in (False, True):
+            with self.subTest(has_kill=has_kill):
+                clan = module.ClanBattle(1)
+                clan.loop_num = clan.bot_id = 1
+                clan.get_clanbattle_top = AsyncMock(return_value=S(
+                    lap_num=0, period_rank=1, damage_history=[], boss_info=[]))
+                clan.refresh_boss = AsyncMock()
+                clan.send_notice = AsyncMock()
+                clan.notice_text = AsyncMock(return_value="")
+                clan.add_record = AsyncMock(return_value={})
+                clan.reconcile_damage = AsyncMock()
+                histories = [history(1, 200, 10, kill=1)] if has_kill else []
+                clan.damage_correction.update = lambda _: histories
+                clan.damage_correction.cap_for = lambda _: 100
+                pool = module.ClanBattlePool(1)
+                pool.add_task = AsyncMock()
+                item = module.PrioritizedQueryItem(data=module.ClanbattleItem(clan, 1))
+                with patch.object(module, "damage_reconciler", S(observe=AsyncMock())):
+                    await pool.do_single(item)
+                    await asyncio.sleep(0)
+                clan.add_record.assert_awaited_once_with(1)
+                clan.reconcile_damage.assert_awaited_once()
+                pool.add_task.assert_awaited_once()
 
     async def test_delayed_detail_reconciliation_passes_battle_and_evidence(self):
         clan = self.monitor_module.ClanBattle(619935706)
@@ -520,6 +571,30 @@ class MonitorIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ORMIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sl_and_timer_commit_once_and_rollback_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = dal.SQALA(directory + "/sl.db")
+            await db.create_all()
+            await db.save_battle_entries(1, "before")
+            async with db.engine.begin() as conn:
+                await conn.execute(text("""CREATE TRIGGER fail_timer BEFORE UPDATE ON battleentrystate
+                    BEGIN SELECT RAISE(ABORT, 'test timer failure'); END"""))
+            sl = models.SLDao(group_id=1, user_id=2, time=int(time.time()))
+            with self.assertRaises(IntegrityError):
+                await db.add_sl(sl, "after")
+            self.assertFalse(await db.check_sl(2, 1))
+            self.assertEqual(await db.get_battle_entries(1), "before")
+            async with db.engine.begin() as conn:
+                await conn.execute(text("DROP TRIGGER fail_timer"))
+            accepted = await asyncio.gather(db.add_sl(sl, "first"), db.add_sl(sl, "second"))
+            self.assertEqual(sum(accepted), 1)
+            self.assertEqual(await db.get_battle_entries(1), "first" if accepted[0] else "second")
+            self.assertTrue(await db.check_sl(2, 1))
+            async with db.engine.begin() as conn:
+                await conn.execute(text("UPDATE sldao SET time=NULL"))
+            self.assertTrue(await db.add_sl(sl))
+            await db.engine.dispose()
+
     async def test_real_schema_and_delayed_snapshot_correction(self):
         with tempfile.TemporaryDirectory() as directory:
             db = dal.SQALA(directory + "/orm.db")

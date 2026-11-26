@@ -14,6 +14,7 @@ from ..client import (
     LoadIndexResponse,
     check_client,
 )
+from ..client.base import CrossLoopLock
 from ..client.response import (
     BattleInfo,
     ClanBattleLogListResponse,
@@ -27,11 +28,22 @@ from ..util.task_pool import PoolBase, PrioritizedQueryItemBase
 from ..util.tools import anywhere_send
 from ..util.auto_boss import clan_boss_info
 from .base import find_item, format_bignum, format_precent
-from .damage_correction import DamageCorrectionTracker
+from .damage_correction import DamageCorrectionTracker, history_key
+from .entry_tracker import EntryTracker
 from .reconciliation import damage_reconciler
 from ..database.reconciliation import encode
 
 from traceback import format_exc
+
+
+def estimate_carry_seconds(hp, raw_damage, start_time, battle_time):
+    # Only normal 90s attacks earn carryover. A short carryover cannot earn more.
+    if (not isinstance(hp, int) or not isinstance(raw_damage, int)
+            or not 0 < hp <= raw_damage or start_time != 90
+            or not isinstance(battle_time, int) or not 0 <= battle_time <= 90):
+        return None
+    # ceil(110 - elapsed * hp / damage), without floating-point rounding.
+    return min(90, 110 - battle_time * hp // raw_damage)
 
 
 class ClanBattle:
@@ -51,6 +63,9 @@ class ClanBattle:
         self.period = ""
         self.dao_update_time = 0  # 网页端更新标记
         self.damage_correction = DamageCorrectionTracker()
+        self.entry_lock = CrossLoopLock()
+        self.entries = EntryTracker('')
+        self.saved_entry_state = self.entries.dump()
 
     async def init(self, client: BaseClient, user_id: int, bot_id: int):
         self.loop_num += 1
@@ -72,6 +87,15 @@ class ClanBattle:
 
         self.clan_battle_id = clan_battle_top.clan_battle_id
         self.battle_period = clan_battle_top.period
+        async with self.entry_lock:
+            self.saved_entry_state = await pcr_sqla.get_battle_entries(self.group_id)
+            self.entries = EntryTracker(
+                f'{self.clan_id}:{self.clan_battle_id}',
+                self.saved_entry_state,
+            )
+            for history in sorted(clan_battle_top.damage_history or [], key=lambda h: h.create_time):
+                self.entries.settle(history)
+            await self.save_entries_if_changed()
         self.clan_name = clan_battle_top.user_clan.clan_name
         self.lap_num = clan_battle_top.lap_num
         self.period = clan_boss_info.lap2stage(self.lap_num)
@@ -99,10 +123,12 @@ class ClanBattle:
                 reload_detail_info = await self.client.clan_battle_detail_info(
                     self.clan_id, self.clan_battle_id, lap_num, order
                 )
-                if reload_detail_info.fighter_num != boss.fighter_num:
-                    boss.fighter_num = reload_detail_info.fighter_num
-                    return reload_detail_info.fighter_num
+                async with self.entry_lock:
+                    added = self.entries.observe(order, lap_num, reload_detail_info.fighter_num, int(time.time()))
+                    boss.fighter_num = len(self.entries.bosses.get(str(order), {}).get('entries', []))
+                    return boss.fighter_num if added else 0
         except Exception:
+            logger.exception('读取或保存进刀计时失败')
             return 0
         return 0  # 0不播报，没改变不报，改变了是0也不报
 
@@ -114,11 +140,12 @@ class ClanBattle:
     async def add_record(self, loop_num: int):
         log_list: List[BattleInfo] = []
         dao_list = []
+        timings = {}
         with contextlib.suppress(Exception):
             # 故意不重试，这循环极端情况下运行10分钟也正常，不如报错趁早退出，下次再来
             log_temp = await self.get_battle_log(1)  # 获取最大页数
             if not log_temp.battle_list:
-                return  # 数据空
+                return timings  # 数据空
 
             latest_time = await pcr_sqla.get_latest_time(self.group_id)
             existing_keys = await pcr_sqla.get_record_keys_at(self.group_id, latest_time)
@@ -146,8 +173,11 @@ class ClanBattle:
                         record, time, allow_damage_correction=key_counts[key] == 1
                     )
                     dao_list.append(record_dao)
+                    if key_counts[key] == 1:
+                        timings[key] = (record_dao.remain_time, record_dao.battle_time, record.total_damage)
         if dao_list:
             await pcr_sqla.add_record(dao_list)
+        return timings
 
     async def general_single_record(
         self, record: BattleInfo, time: int, allow_damage_correction: bool = True
@@ -252,34 +282,65 @@ class ClanBattle:
             ):
                 self.notice_subscribe.append(subscribe_text)
                 # 查看当前出刀人数
-            if fighter_num := await self.refresh_fighter_num(
-                current_boss.lap_num, current_boss.order_num
-            ):
-                self.notice_fighter.append(f"{i+1}王当前有{fighter_num}人出刀")
             if (
                 current_boss.current_hp != boss.current_hp
                 or current_boss.lap_num != boss.lap_num
             ):
                 change = True
-                boss.refresh(
-                    current_boss.current_hp,
-                    current_boss.lap_num,
-                    current_boss.order_num,
-                    current_boss.max_hp,
-                )
+                boss.refresh(current_boss.current_hp, current_boss.lap_num,
+                             current_boss.order_num, current_boss.max_hp)
+            if fighter_num := await self.refresh_fighter_num(
+                current_boss.lap_num, current_boss.order_num
+            ):
+                self.notice_fighter.append(self.entries.describe(i + 1, int(time.time())))
         return change
 
-    async def record_change(self, clan_battle_top: ClanBattleTopResponse):
+    async def save_entries_if_changed(self):
+        state = self.entries.dump()
+        if state != self.saved_entry_state:
+            try:
+                await pcr_sqla.save_battle_entries(self.group_id, state)
+            except Exception:
+                logger.exception("进刀计时保存失败，将在下轮重试")
+            else:
+                self.saved_entry_state = state
+
+    async def record_change(self, clan_battle_top: ClanBattleTopResponse) -> bool:
+        """Return whether this poll already fetched detailed reports for carryover."""
+        loop_num = self.loop_num
+        async with self.entry_lock:
+            for history in sorted(clan_battle_top.damage_history or [], key=lambda h: h.create_time):
+                self.entries.settle(history)
+            await self.save_entries_if_changed()
+            for order, boss in enumerate(self.boss, 1):
+                boss.fighter_num = len(self.entries.bosses.get(str(order), {}).get('entries', []))
         histories = self.damage_correction.update(clan_battle_top)
         await damage_reconciler.observe(self, clan_battle_top, histories)
+        needs_timing = any(h.kill and self.damage_correction.cap_for(history_key(h)) is not None for h in histories)
+        timings = {}
+        if needs_timing:
+            try:
+                timings = await self.add_record(loop_num)
+            except Exception:
+                logger.exception("战报入库失败，将在下轮重试")
+        if loop_num != self.loop_num:
+            raise CancelledError
         for history in histories:
             damage = self.damage_correction.history_damage(history)
-            correction = (
-                f"（原始伤害{history.damage:,}，已扣除超量伤害）"
-                if damage < history.damage else ""
-            )
-            self.notice_dao.append(
-                f'{history.name}对{history.lap_num}周目{history.order_num}王造成了{damage:,}点伤害。{correction}{"并击破" if history.kill else ""}')
+            message = f"{history.name}对{history.lap_num}周目{history.order_num}王造成了{damage:,}点伤害"
+            if damage < history.damage:
+                message += f"（原始伤害{history.damage:,}，已扣除超量伤害）"
+            if history.kill:
+                message += "并击破"
+                key = history_key(history)
+                if key in timings:
+                    start, elapsed, raw = timings[key]
+                    seconds = estimate_carry_seconds(
+                        self.damage_correction.cap_for(key), max(raw, history.damage), start, elapsed,
+                    )
+                    if seconds is not None:
+                        message += f"，预计返秒{seconds}s"
+            self.notice_dao.append(message + "。")
             # 通知挂树，清空申请出刀
             if history.kill:
                 if offtree_text := await self.notice_text(
@@ -290,6 +351,7 @@ class ClanBattle:
 
         self.dao_update_time = int(time.time())
         self.refresh_latest_time(clan_battle_top)
+        return needs_timing
 
     async def reconcile_damage(self):
         # A detailed report can become visible after top was fetched in the
@@ -318,7 +380,8 @@ class ClanBattle:
         return (
             "当前进度："
             + f"{self.period}面{stage_dict[self.period]}阶段\n"
-            + "\n".join([boss.boss_info() for boss in self.boss])
+            + "\n".join(boss.boss_info() + ('\n' + detail if (detail := self.entries.describe(i, int(time.time()))) else '')
+                        for i, boss in enumerate(self.boss, 1))
         )
 
 
@@ -344,8 +407,6 @@ class Boss:
         msg = f"{self.lap_num}周目{self.order}王: "
         if self.current_hp:
             msg += f"HP: {format_bignum(self.current_hp)}/{format_bignum(self.max_hp)} {format_precent(self.current_hp/self.max_hp)}"
-            if self.fighter_num:
-                msg += f" 当前有{self.fighter_num}人挑战"
         else:
             msg += "无法挑战"
         return msg
@@ -395,11 +456,14 @@ class ClanBattlePool(PoolBase):
             )
 
             # Damage histories can change even when a snapshot's HP does not.
-            await clan_info.record_change(clan_battle_top)
+            if loop_num != clan_info.loop_num:
+                raise CancelledError
+            reports_fetched = await clan_info.record_change(clan_battle_top)
             await clan_info.send_notice(
                 [NoticeType.dao.value, NoticeType.tree.value]
             )
-            await clan_info.add_record(loop_num)
+            if not reports_fetched:
+                await clan_info.add_record(loop_num)
             await clan_info.reconcile_damage()
             clan_info.error_count = 0
         asyncio.create_task(

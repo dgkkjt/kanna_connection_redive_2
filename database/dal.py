@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union
 
 from sqlalchemy import asc, delete, desc, insert, text, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.future import select
 from sqlalchemy.orm import sessionmaker
@@ -13,6 +14,7 @@ from ..basedata import FilePath, NoticeType
 from .reconciliation import migrate as migrate_damage_reconciliation, encode
 from .models import (
     Account,
+    BattleEntryState,
     ArenaSetting,
     ClanBattleKPI,
     ClanBattleMember,
@@ -453,13 +455,30 @@ class SQALA:
 
                 await session.merge(notice)
 
-    async def add_sl(self, sl: SLDao) -> bool:
+    async def get_battle_entries(self, group_id: int) -> str:
         async with self.async_session() as session:
-            async with session.begin():
-                if await self.check_sl(sl.user_id, sl.group_id):
-                    return False
-                await session.merge(sl)
-                return True
+            row = await session.get(BattleEntryState, group_id)
+            return row.state if row else ""
+
+    async def save_battle_entries(self, group_id: int, state: str):
+        async with self.async_session.begin() as session:
+            await session.merge(BattleEntryState(group_id=group_id, state=state))
+
+    async def add_sl(self, sl: SLDao, entry_state: Optional[str] = None) -> bool:
+        day_start = int(pcr_date(sl.time).timestamp())
+        insert_sl = sqlite_insert(SLDao).values(group_id=sl.group_id, user_id=sl.user_id, time=sl.time)
+        statement = insert_sl.on_conflict_do_update(
+            index_elements=["group_id", "user_id"],
+            set_={"time": sl.time},
+            where=func.coalesce(SLDao.time, 0) < day_start,
+        )
+        async with self.async_session.begin() as session:
+            result = await session.execute(statement)
+            if not result.rowcount:
+                return False
+            if entry_state is not None:
+                await session.merge(BattleEntryState(group_id=sl.group_id, state=entry_state))
+            return True
 
     async def check_sl(self, uid: int, group_id: int) -> bool:
         async with self.async_session() as session:
@@ -468,7 +487,7 @@ class SQALA:
                     select(SLDao).where(
                         SLDao.user_id == uid,
                         SLDao.group_id == group_id,
-                        SLDao.time > pcr_date(datetime.now().timestamp()).timestamp(),
+                        SLDao.time >= pcr_date(datetime.now().timestamp()).timestamp(),
                     )
                 )
                 return bool(result.scalar_one_or_none())
